@@ -19,6 +19,11 @@ from functools import lru_cache
 import os
 import tempfile
 import re
+from database import DocumentDatabase
+import sqlite3
+
+# Initialize database
+db = DocumentDatabase()
 
 # ===== KONFIGURASI DAN PENGATURAN AWAL =====
 
@@ -816,9 +821,9 @@ def exact_match_search(keyword, split_texts, sentence_index):
     st.info(f"Pencarian exact match selesai dalam {end_time - start_time:.2f} detik")
     return results
 
-# Optimasi untuk BM25 search dengan prioritas kalimat panjang
+# Optimasi untuk BM25 search dengan prioritas kalimat panjang dan pengelompokan paragraf
 def bm25_search(keyword, split_texts, processed_sentences):
-    """Pencarian BM25 dengan prioritas kalimat panjang"""
+    """Pencarian BM25 dengan prioritas kalimat panjang dan pengelompokan paragraf"""
     start_time = time.time()
     results = {}
 
@@ -860,7 +865,6 @@ def bm25_search(keyword, split_texts, processed_sentences):
                 tokenized_corpus.append(file_processed[idx]['stemmed'])
                 original_sentences.append(sent)
                 sentence_indices.append(idx)
-                # Simpan panjang kalimat untuk prioritasi
                 sentence_lengths.append(file_processed[idx].get('length', len(sent.split())))
         
         # Skip jika tidak ada kalimat terproses
@@ -873,8 +877,12 @@ def bm25_search(keyword, split_texts, processed_sentences):
             bm25 = BM25Okapi(tokenized_corpus, k1=1.5, b=0.75)
             scores = bm25.get_scores(expanded_query)
             
-            # Aplikasikan bonus untuk kalimat panjang dan kalimat yg mengandung keyword asli
-            result_sentences = []
+            # Kelompokkan kalimat menjadi paragraf (8 kalimat per paragraf)
+            paragraph_size = 8
+            paragraphs = []
+            current_paragraph = []
+            current_scores = []
+            
             for i, (score, sent, sent_idx, sent_len) in enumerate(zip(scores, original_sentences, sentence_indices, sentence_lengths)):
                 if score > 0.01:  # Filter threshold
                     # Bonus untuk kalimat yang mengandung kata kunci asli
@@ -887,15 +895,28 @@ def bm25_search(keyword, split_texts, processed_sentences):
                     # Skor akhir dengan kombinasi bonus
                     final_score = score * keyword_bonus * length_bonus
                     
-                    result_sentences.append((final_score, sent_idx, sent, sent_len))
+                    current_paragraph.append((sent_idx, sent))
+                    current_scores.append(final_score)
+                    
+                    # Jika paragraf sudah penuh atau ini kalimat terakhir, simpan paragraf
+                    if len(current_paragraph) >= paragraph_size or i == len(scores) - 1:
+                        if current_paragraph:
+                            # Hitung skor rata-rata untuk paragraf
+                            avg_score = sum(current_scores) / len(current_scores)
+                            paragraphs.append((avg_score, current_paragraph))
+                            current_paragraph = []
+                            current_scores = []
             
-            # Sort berdasarkan skor final
-            result_sentences.sort(reverse=True, key=lambda x: x[0])
+            # Sort berdasarkan skor rata-rata paragraf
+            paragraphs.sort(reverse=True, key=lambda x: x[0])
             
-            # Ambil top results dalam format (idx, sentence)
-            top_results = [(idx, sent) for _, idx, sent, _ in result_sentences[:MAX_RESULTS_TO_SHOW]]
+            # Ambil paragraf terbaik
+            if paragraphs:
+                best_paragraph = paragraphs[0][1]  # Ambil paragraf dengan skor tertinggi
+                return file, best_paragraph
             
-            return file, top_results
+            return file, []
+            
         except Exception as e:
             st.error(f"Error BM25: {str(e)}")
             return file, []
@@ -1537,7 +1558,7 @@ def reset_document_cache():
 # ===== UI STREAMLIT =====
 
 def main():
-    st.title("Document Search with Evaluation - Optimized")
+    st.title("Document Search with Evaluation - Database Enabled")
     
     # Sidebar untuk pengaturan
     with st.sidebar:
@@ -1570,16 +1591,13 @@ def main():
         if st.button("Reset Cache Dokumen", key="reset_cache_btn"):
             reset_document_cache()
         
-        # Tampilkan statistik cache jika ada
-        if st.session_state.file_stats:
-            st.subheader("Statistik Dokumen")
-            for file, stats in st.session_state.file_stats.items():
-                st.write(f"**{file}**")
-                st.write(f"- Kalimat: {stats.get('sentences', 0)}")
-                st.write(f"- Kata: {stats.get('words', 0)}")
-                st.write(f"- Ukuran: {stats.get('size', 0) // 1024} KB")
-                st.write("---")
-                
+        # Tampilkan statistik database
+        db_stats = db.get_document_stats()
+        st.subheader("Statistik Database")
+        st.write(f"Total Dokumen: {db_stats['total_documents']}")
+        st.write(f"Total Ukuran: {db_stats['total_size'] // 1024} KB")
+        st.write(f"Dokumen Terproses: {db_stats['processed_documents']}")
+        
         # Tampilkan info bahasa stopwords aktif
         st.subheader("Bahasa Stopwords Aktif")
         if st.session_state.stopwords_language == "english+indonesia":
@@ -1600,17 +1618,13 @@ def main():
     # Progress container
     progress_container = st.empty()
     
-    # Hanya proses file jika ada perubahan atau belum diproses
-    if uploaded_files and have_files_changed(uploaded_files):
+    # Proses file yang diunggah
+    if uploaded_files:
         with progress_container.container():
             with st.spinner("Memproses dokumen..."):
                 # Progress bar dan status text
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
-                # Reset cache untuk pemrosesan baru
-                st.session_state.doc_texts = {}
-                st.session_state.split_texts = {}
                 
                 # Ekstraksi teks dari file
                 total_files = len(uploaded_files)
@@ -1631,62 +1645,44 @@ def main():
                     else:
                         continue
                     
-                    # Simpan teks yang berhasil diekstrak
+                    # Simpan ke database jika berhasil diekstrak
                     if text and len(text.strip()) > 0:
-                        st.session_state.doc_texts[uploaded_file.name] = text
+                        document_id = db.add_document(uploaded_file.name, text, uploaded_file.size)
+                        if document_id:
+                            st.success(f"File {uploaded_file.name} berhasil ditambahkan ke database dengan ID: {document_id}")
+                        else:
+                            st.warning(f"File {uploaded_file.name} sudah ada dalam database")
                     
                     # Update progress
                     progress_bar.progress((i + 1) / total_files)
                 
-                # Pecah teks menjadi kalimat dan buat index
-                if st.session_state.doc_texts:
-                    # Split sentences
-                    status_text.text("Membagi dokumen menjadi kalimat...")
-                    st.session_state.split_texts = split_into_sentences(st.session_state.doc_texts)
-                    
-                    # Build index untuk pencarian lebih cepat
-                    status_text.text("Membuat index pencarian...")
-                    st.session_state.sentence_index, st.session_state.processed_sentences = build_sentence_index(
-                        st.session_state.split_texts
-                    )
-                    
-                    # Simpan info file yang diproses
-                    st.session_state.processed_files = {file.name for file in uploaded_files}
-                    
-                    status_text.text("Pemrosesan dokumen selesai!")
-                    st.success(f"Berhasil memproses {len(st.session_state.doc_texts)} dokumen")
-                else:
-                    status_text.text("Tidak ada dokumen yang berhasil diproses.")
-                    st.warning("Tidak ada teks yang berhasil diekstrak dari file. Pastikan file tidak kosong dan dalam format yang valid.")
+                status_text.text("Pemrosesan dokumen selesai!")
                 
                 # Clear progress display
                 progress_bar.empty()
                 status_text.empty()
     
-    # Tampilkan info dokumen yang diproses
-    if st.session_state.doc_texts:
-        st.info(f"Ada {len(st.session_state.doc_texts)} dokumen yang telah diproses dan siap untuk dicari.")
+    # Tampilkan dokumen yang tersedia
+    all_documents = db.get_all_documents()
+    if all_documents:
+        st.info(f"Ada {len(all_documents)} dokumen dalam database.")
         
         # Tombol untuk melihat dokumen
-        with st.expander("Lihat Dokumen"):
-            # Loop untuk setiap dokumen: tampilkan judul dan total pecahan kalimat
-            for file, sentences in st.session_state.split_texts.items():
-                total_sentences = len(sentences)
-                st.write(f"**{file}**: {total_sentences} kalimat")
+        with st.expander("Lihat Dokumen dalam Database"):
+            for doc_id, filename, content in all_documents:
+                st.write(f"**ID: {doc_id} - {filename}**")
                 
-                # Tampilkan contoh kalimat dari dokumen
+                # Split content into sentences
+                sentences = nltk.sent_tokenize(content)
+                total_sentences = len(sentences)
+                st.write(f"Total kalimat: {total_sentences}")
+                
+                # Tampilkan contoh kalimat
                 if total_sentences > 0:
                     st.write("Contoh kalimat:")
-                    
-                    # Tampilkan beberapa kalimat dari awal, tengah, dan akhir dokumen
-                    if total_sentences > 6:
-                        sample_indices = [0, 1, total_sentences//2, total_sentences//2 + 1, total_sentences-2, total_sentences-1]
-                        samples = [sentences[i] for i in range(total_sentences) if i in sample_indices]
-                    else:
-                        samples = sentences
-                    
-                    for idx, sentence in samples[:6]:  # Batasi jumlah contoh
-                        st.write(f"- [{idx}] {sentence[:100]}..." if len(sentence) > 100 else f"- [{idx}] {sentence}")
+                    sample_size = min(3, total_sentences)
+                    for i in range(sample_size):
+                        st.write(f"- {sentences[i][:100]}..." if len(sentences[i]) > 100 else f"- {sentences[i]}")
                 
                 st.write("---")
     
@@ -1710,8 +1706,8 @@ def main():
     if search_button:
         if not keyword:
             st.warning("Silakan masukkan kata kunci untuk pencarian.")
-        elif not st.session_state.split_texts:
-            st.error("Belum ada dokumen yang diproses. Silakan unggah dokumen terlebih dahulu.")
+        elif not all_documents:
+            st.error("Belum ada dokumen dalam database. Silakan unggah dokumen terlebih dahulu.")
         else:
             # Validasi keyword
             if len(keyword.strip()) < 2:
@@ -1724,19 +1720,52 @@ def main():
                     # Menampilkan timer
                     start_time = time.time()
                     
-                    # Pencarian dengan metode yang dipilih
+                    # Proses pencarian
                     with st.spinner(f'Melakukan pencarian {search_method}...'):
+                        # Get all documents from database
+                        documents = db.get_all_documents()
+                        
+                        # Process documents for search
+                        processed_docs = {}
+                        processed_sentences = {}
+                        
+                        for doc_id, filename, content in documents:
+                            # Split into sentences
+                            sentences = nltk.sent_tokenize(content)
+                            processed_docs[filename] = [(i+1, sent) for i, sent in enumerate(sentences)]
+                            
+                            # Process sentences for BM25
+                            file_processed = {}
+                            for idx, sent in enumerate(sentences):
+                                # Preprocessing
+                                clean_text = advanced_preprocess(sent)
+                                tokens = nltk.word_tokenize(clean_text)
+                                
+                                # Remove stopwords and stem
+                                tokens_no_stop = remove_stopwords(tokens)
+                                stemmed_tokens = stem_sentence(tokens_no_stop)
+                                
+                                # Store processed tokens
+                                file_processed[idx+1] = {
+                                    'tokens': tokens_no_stop,
+                                    'stemmed': stemmed_tokens,
+                                    'length': len(sent.split())
+                                }
+                            
+                            processed_sentences[filename] = file_processed
+                        
+                        # Perform search
                         if search_method == "Exact Match":
                             search_results = exact_match_search(
                                 keyword, 
-                                st.session_state.split_texts,
-                                st.session_state.sentence_index
+                                processed_docs,
+                                None  # No index needed for exact match
                             )
                         elif search_method == "BM25":
                             search_results = bm25_search(
                                 keyword, 
-                                st.session_state.split_texts,
-                                st.session_state.processed_sentences
+                                processed_docs,
+                                processed_sentences  # Pass processed sentences
                             )
                     
                     search_time = time.time() - start_time
@@ -1747,7 +1776,7 @@ def main():
                         with st.spinner('Mengevaluasi hasil pencarian...'):
                             eval_results = sort_by_evaluation_batched(
                                 search_results, 
-                                st.session_state.split_texts, 
+                                processed_docs, 
                                 eval_method
                             )
                         
@@ -1757,6 +1786,10 @@ def main():
                         for i, (rouge, meteor, file, idx, sentence, explanation) in enumerate(eval_results):
                             with st.container():
                                 st.subheader(f"Hasil #{i+1}")
+                                
+                                # Get document ID from filename
+                                doc_id = next((doc[0] for doc in documents if doc[1] == file), None)
+                                st.write(f"**Dokumen ID:** {doc_id}")
                                 st.write(f"**Dokumen:** {file}")
                                 
                                 # Highlight keyword dalam kalimat
@@ -1767,15 +1800,6 @@ def main():
                                     flags=re.IGNORECASE
                                 )
                                 st.write(f"**Kalimat:** {highlighted_sentence}")
-                                
-                                # Tampilkan panjang kalimat (tanpa bonus)
-                                sentence_length = explanation.get("sentence_length", len(sentence.split()))
-                                st.write(f"**Panjang Kalimat:** {sentence_length} kata")
-                                
-                                # Tampilkan flag kalimat pendek jika ada
-                                is_short_sentence = explanation.get("is_short_sentence", False)
-                                if is_short_sentence:
-                                    st.info("Ini adalah kalimat pendek, skor evaluasi telah ditingkatkan.")
                                 
                                 # Tampilkan metrik evaluasi
                                 col1, col2 = st.columns(2)
@@ -1805,53 +1829,11 @@ def main():
                                     if "comparison_sentence" in explanation:
                                         st.write(f"**Kalimat Pembanding:** {explanation['comparison_sentence']}")
                                     
-                                    # PERHITUNGAN MANUAL ROUGE-L
-                                    st.write("**Rincian Perhitungan ROUGE-L:**")
-                                    
-                                    # Menampilkan token-token dari kalimat referensi dan prediksi (termasuk stemming)
-                                    if 'y_true_tokens' in explanation and 'y_pred_tokens' in explanation:
-                                        st.write(f"- Token kalimat referensi (setelah stemming): {explanation['y_true_tokens']}")
-                                        st.write(f"- Token kalimat prediksi (setelah stemming): {explanation['y_pred_tokens']}")
-                                        
-                                        ref_tokens = len(explanation['y_true_tokens'])
-                                        pred_tokens = len(explanation['y_pred_tokens'])
-                                        
-                                        # Menggunakan nilai dari rouge untuk konsistensi
-                                        precision_decimal = rouge['precision'] / 100
-                                        # Hitung LCS berdasarkan precision untuk konsistensi
-                                        calculated_lcs = round(precision_decimal * pred_tokens)
-                                        
-                                        # Tampilkan perhitungan yang sederhana dengan nilai yang sama
-                                        st.write(f"- Jumlah token kalimat referensi: {ref_tokens}")
-                                        st.write(f"- Jumlah token kalimat prediksi: {pred_tokens}")
-                                        st.write(f"- Panjang LCS: {calculated_lcs}")
-                                        
-                                        # Perhitungan precision, recall, dan F-measure yang konsisten dengan nilai di ROUGE-L Metrics
-                                        st.write(f"- Precision = LCS / Jumlah token prediksi = {calculated_lcs} / {pred_tokens} = {rouge['precision'] / 100:.4f} = {rouge['precision']:.2f}%")
-                                        st.write(f"- Recall = LCS / Jumlah token referensi = {calculated_lcs} / {ref_tokens} = {rouge['recall'] / 100:.4f} = {rouge['recall']:.2f}%")
-                                        
-                                        # F-measure dengan nilai yang sama persis dengan yang ditampilkan di metrik utama
-                                        st.write(f"- F-measure = (2 * Precision * Recall) / (Precision + Recall)")
-                                        precision_for_calc = rouge['precision'] / 100
-                                        recall_for_calc = rouge['recall'] / 100
-                                        st.write(f"  = (2 * {precision_for_calc:.4f} * {recall_for_calc:.4f}) / ({precision_for_calc:.4f} + {recall_for_calc:.4f})")
-                                        st.write(f"  = {rouge['f_measure'] / 100:.4f} = {rouge['f_measure']:.2f}%")
-                                    
-                                    # Perbaikan bagian METEOR
-                                    st.write("**Rincian Perhitungan METEOR:**")
-                                    if 'meteor_base' in explanation:
-                                        st.write(f"- Skor METEOR: {meteor:.2f}%")
-                                        st.write(f"- METEOR dihitung berdasarkan token yang cocok antara kalimat referensi dan prediksi dengan penambahan sinonim.")
-                                        if 'meteor_base' in explanation and 'meteor_expanded' in explanation:
-                                            st.write(f"- METEOR dasar (tanpa ekspansi sinonim): {explanation['meteor_base']:.2f}%")
-                                            st.write(f"- METEOR dengan ekspansi sinonim: {explanation['meteor_expanded']:.2f}%")
-                                    
-                                    # Tampilkan info tambahan jika ada error
-                                    if 'error' in explanation:
-                                        st.error(f"Error dalam perhitungan: {explanation['error']}")
-                                    
-                                    if 'note' in explanation:
-                                        st.write(f"**Catatan:** {explanation['note']}")
+                                    # Tampilkan rincian perhitungan
+                                    st.write("**Rincian Perhitungan:**")
+                                    for key, value in explanation.items():
+                                        if key not in ['short_sentence_info', 'self_evaluation', 'artificial_reference', 'comparison_sentence']:
+                                            st.write(f"- {key}: {value}")
                                 
                                 st.write("---")
                     else:
