@@ -1,6 +1,6 @@
 import streamlit as st
 import fitz  # PyMuPDF untuk PDF
-import docx
+# import docx
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
@@ -12,7 +12,7 @@ import numpy as np
 import random
 import time
 import concurrent.futures
-from PyPDF2 import PdfFileReader, PdfFileWriter
+# from PyPDF2 import PdfFileReader, PdfFileWriter
 import traceback
 import hashlib
 import pickle

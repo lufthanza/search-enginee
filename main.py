@@ -843,7 +843,7 @@ def exact_match_search(keyword, split_texts, sentence_index):
     
     # Preprocessing keyword
     keyword_lower = keyword.lower()
-    keyword_terms = keyword_lower.split()
+    # keyword_terms = keyword_lower.split()
     
     # Buat pola regex untuk whole word matching (compile sebelumnya untuk kecepatan)
     pattern = re.compile(r'\b(' + re.escape(keyword_lower) + r')\b', re.IGNORECASE)
@@ -931,7 +931,7 @@ def exact_match_search(keyword, split_texts, sentence_index):
 # Optimasi untuk BM25 search dengan prioritas kalimat panjang
 def bm25_search(keyword, split_texts, processed_sentences):
     """Pencarian BM25 dengan prioritas kalimat panjang dan caching"""
-    # Check cache first - NEW
+    # Check cache first
     cache_key = get_search_cache_key(keyword, "bm25")
     if cache_key in st.session_state.search_cache:
         st.info(f"Menggunakan hasil pencarian dari cache")
@@ -940,88 +940,72 @@ def bm25_search(keyword, split_texts, processed_sentences):
     start_time = time.time()
     results = {}
 
-    # Proses tokenisasi keyword 
+    # Proses keyword sebagai satu unit
     keyword_clean = advanced_preprocess(keyword)
-    query_tokens = nltk.word_tokenize(keyword_clean)
-    query_tokens = remove_stopwords(query_tokens)
-    query_tokens = stem_sentence(query_tokens)
     
-    # Ekspansi query terbatas
-    expanded_query = query_tokens.copy()
-    if len(query_tokens) > 0:
-        # Tambahkan sinonim untuk kata kunci pertama
-        main_token = query_tokens[0]
-        synonyms = get_synonyms(main_token)[:1]  # Max 1 sinonim
-        expanded_query.extend(synonyms)
-    
-    # Verifikasi ada token valid setelah preprocessing
-    if not expanded_query:
-        st.warning("Kata kunci terlalu pendek atau hanya berisi stopwords.")
-        return {}
-
     def process_document(file_sentences_processed):
         file, sentences, file_processed = file_sentences_processed
         
-        # Cek apakah dokumen sudah diproses
         if not file_processed:
             return file, []
             
-        # Dapatkan corpus yang sudah diproses
+        # Prepare corpus
         tokenized_corpus = []
         original_sentences = []
         sentence_indices = []
-        sentence_lengths = []
         
-        # Kumpulkan kalimat dan token yang diproses
+        # Process each sentence as a whole unit
         for idx, sent in sentences:
             if idx in file_processed:
-                tokenized_corpus.append(file_processed[idx]['stemmed'])
+                # Get the full sentence tokens
+                sent_tokens = file_processed[idx]['tokens']
+                tokenized_corpus.append(sent_tokens)
                 original_sentences.append(sent)
                 sentence_indices.append(idx)
-                # Simpan panjang kalimat untuk prioritasi
-                sentence_lengths.append(file_processed[idx].get('length', len(sent.split())))
         
-        # Skip jika tidak ada kalimat terproses
         if not tokenized_corpus:
             return file, []
             
-        # Buat model BM25
         try:
-            # Parameter BM25 yang disesuaikan
+            # Create BM25 model with adjusted parameters
             bm25 = BM25Okapi(tokenized_corpus, k1=1.5, b=0.75)
-            scores = bm25.get_scores(expanded_query)
             
-            # Aplikasikan bonus untuk kalimat panjang dan kalimat yg mengandung keyword asli
+            # Process query as a whole unit
+            query_tokens = nltk.word_tokenize(keyword_clean)
+            scores = bm25.get_scores(query_tokens)
+            
+            # Calculate match quality
             result_sentences = []
-            for i, (score, sent, sent_idx, sent_len) in enumerate(zip(scores, original_sentences, sentence_indices, sentence_lengths)):
+            for i, (score, sent, sent_idx) in enumerate(zip(scores, original_sentences, sentence_indices)):
                 if score > 0.01:  # Filter threshold
-                    # Bonus untuk kalimat yang mengandung kata kunci asli
-                    contains_keyword = keyword_clean in sent.lower()
-                    keyword_bonus = 1.5 if contains_keyword else 1.0
+                    # Calculate position score
+                    sent_lower = sent.lower()
+                    keyword_lower = keyword_clean.lower()
+                    match_position = sent_lower.find(keyword_lower)
+                    position_score = 1.0 - (match_position / len(sent_lower)) if match_position >= 0 else 0
                     
-                    # Bonus untuk kalimat panjang (10% per 10 kata)
-                    length_bonus = 1.0 + (sent_len / 100) 
+                    # Calculate length score
+                    length_score = 1.0 / (1.0 + abs(len(sent.split()) - len(keyword.split()) * 2))
                     
-                    # Skor akhir dengan kombinasi bonus
-                    final_score = score * keyword_bonus * length_bonus
+                    # Combined score with position and length factors
+                    final_score = score * 0.6 + position_score * 0.2 + length_score * 0.2
                     
-                    result_sentences.append((final_score, sent_idx, sent, sent_len))
+                    result_sentences.append((final_score, sent_idx, sent))
             
-            # Sort berdasarkan skor final
+            # Sort by final score
             result_sentences.sort(reverse=True, key=lambda x: x[0])
             
-            # Ambil top results dalam format (idx, sentence)
-            top_results = [(idx, sent) for _, idx, sent, _ in result_sentences[:MAX_RESULTS_TO_SHOW]]
+            # Get top results
+            top_results = [(idx, sent) for _, idx, sent in result_sentences[:MAX_RESULTS_TO_SHOW]]
             
             return file, top_results
         except Exception as e:
             st.error(f"Error BM25: {str(e)}")
             return file, []
     
-    # Multi-threading untuk pemrosesan dokumen paralel
+    # Process documents in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
-        
         for file, sentences in split_texts.items():
             file_processed = processed_sentences.get(file, {})
             futures.append(executor.submit(
@@ -1037,7 +1021,7 @@ def bm25_search(keyword, split_texts, processed_sentences):
     end_time = time.time()
     st.info(f"Pencarian BM25 selesai dalam {end_time - start_time:.2f} detik")
     
-    # Save to cache - NEW
+    # Save to cache
     st.session_state.search_cache[cache_key] = results
     
     return results
@@ -1961,9 +1945,11 @@ def main():
             eval_method = st.multiselect("Pilih metode evaluasi", ["ROUGE-L", "METEOR"], default=["ROUGE-L", "METEOR"])
         
         # Pilih ukuran konteks paragraf
-        context_size = st.slider("Jumlah kalimat konteks (sebelum & sesudah)", 
-                             min_value=1, max_value=7, value=3, step=1,
-                             help="Jumlah kalimat yang akan ditampilkan sebelum dan sesudah kalimat yang cocok")
+        context_size = st.slider(
+            "Jumlah kalimat konteks (sebelum & sesudah)", 
+            min_value=1, max_value=7, value=3, step=1,
+            help="Jumlah kalimat yang akan ditampilkan sebelum dan sesudah kalimat yang cocok"
+        )
         
         # Tombol Submit form
         search_submitted = st.form_submit_button("Cari")
