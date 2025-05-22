@@ -14,6 +14,8 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import PorterStemmer
 from nltk.translate.meteor_score import meteor_score
 from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Download NLTK resources if not already available
 try:
@@ -178,6 +180,16 @@ def init_database():
     )
     ''')
     
+    # Create tfidf_vectors table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tfidf_vectors (
+        id INTEGER PRIMARY KEY,
+        chunk_id INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        FOREIGN KEY (chunk_id) REFERENCES chunks (id)
+    )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -322,7 +334,18 @@ def build_bm25_model(documents, tokenized_docs=None):
     """Build BM25 model from preprocessed documents"""
     if tokenized_docs is None:
         tokenized_docs = [preprocess_text(doc) for doc in documents]
-    return BM25Okapi(tokenized_docs), tokenized_docs
+    return BM25Okapi(tokenized_docs)
+
+def build_tfidf_model(documents):
+    """Build TF-IDF model from documents"""
+    # Join tokens back to strings for TfidfVectorizer
+    joined_docs = [' '.join(preprocess_text(doc)) for doc in documents]
+    
+    # Create and fit the TF-IDF vectorizer
+    vectorizer = TfidfVectorizer(lowercase=True, analyzer='word')
+    tfidf_matrix = vectorizer.fit_transform(joined_docs)
+    
+    return vectorizer, tfidf_matrix
 
 def calculate_lcs_length(X, Y):
     """Calculate longest common subsequence length between two token lists"""
@@ -421,29 +444,173 @@ def calculate_meteor(reference_tokens, prediction_tokens):
         'synonym_matches': synonym_matches
     }
 
-def search_documents(query, bm25_model, tokenized_documents, original_docs, file_names, top_n=5):
-    """Search documents using BM25"""
-    # Preprocess the query
+def exact_match_search(query, tokenized_documents, original_docs, file_names, top_n=5):
+    """
+    Search documents using exact matching of query terms
+    Calculate scores based on proportion of query terms found in each document
+    """
     tokenized_query = preprocess_text(query)
+    query_terms = set(tokenized_query)
     
-    # Get scores for each document
-    doc_scores = bm25_model.get_scores(tokenized_query)
+    scores = []
+    for doc_tokens in tokenized_documents:
+        doc_terms = set(doc_tokens)
+        # Calculate the proportion of query terms found in the document
+        if len(query_terms) > 0:
+            matches = len(query_terms.intersection(doc_terms))
+            score = matches / len(query_terms)
+        else:
+            score = 0
+        scores.append(score)
     
     # Get top N documents
-    top_indices = sorted(range(len(doc_scores)), key=lambda i: doc_scores[i], reverse=True)[:top_n]
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
     
     results = []
     for idx in top_indices:
-        if doc_scores[idx] > 0:  # Only include documents with positive scores
+        if scores[idx] > 0:  # Only include documents with positive scores
             results.append({
                 'document': original_docs[idx],
-                'score': doc_scores[idx],
+                'score': scores[idx],
                 'tokens': tokenized_documents[idx],
                 'filename': file_names[idx] if file_names else f"Document {idx+1}",
-                'query_tokens': tokenized_query  # Store query tokens for evaluation
+                'query_tokens': tokenized_query
             })
     
     return results
+
+def tfidf_search(query, vectorizer, tfidf_matrix, tokenized_documents, original_docs, file_names, top_n=5):
+    """
+    Search documents using TF-IDF vectors and cosine similarity
+    """
+    # Preprocess and vectorize the query
+    query_text = ' '.join(preprocess_text(query))
+    query_vector = vectorizer.transform([query_text])
+    
+    # Calculate cosine similarity between query and documents
+    cosine_similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+    
+    # Get top N documents
+    top_indices = cosine_similarities.argsort()[::-1][:top_n]
+    
+    results = []
+    for idx in top_indices:
+        if cosine_similarities[idx] > 0:  # Only include documents with positive scores
+            results.append({
+                'document': original_docs[idx],
+                'score': float(cosine_similarities[idx]),
+                'tokens': tokenized_documents[idx],
+                'filename': file_names[idx] if file_names else f"Document {idx+1}",
+                'query_tokens': preprocess_text(query)
+            })
+    
+    return results
+
+def vector_embeddings_search(query, tokenized_documents, original_docs, file_names, top_n=5):
+    """
+    Search documents using simple vector space model
+    Creates document vectors using term frequency and cosine similarity
+    """
+    tokenized_query = preprocess_text(query)
+    
+    # Create a vocabulary from all documents and query
+    vocabulary = set()
+    for doc in tokenized_documents:
+        vocabulary.update(doc)
+    vocabulary.update(tokenized_query)
+    
+    # Convert vocabulary to a list and create a term-index mapping
+    vocabulary_list = list(vocabulary)
+    term_index = {term: idx for idx, term in enumerate(vocabulary_list)}
+    
+    # Create document vectors
+    doc_vectors = []
+    for doc in tokenized_documents:
+        vector = np.zeros(len(vocabulary_list))
+        for term in doc:
+            if term in term_index:
+                vector[term_index[term]] += 1
+        # Normalize the vector
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+        doc_vectors.append(vector)
+    
+    # Create query vector
+    query_vector = np.zeros(len(vocabulary_list))
+    for term in tokenized_query:
+        if term in term_index:
+            query_vector[term_index[term]] += 1
+    # Normalize the query vector
+    query_norm = np.linalg.norm(query_vector)
+    if query_norm > 0:
+        query_vector = query_vector / query_norm
+    
+    # Calculate cosine similarity between query and documents
+    scores = []
+    for doc_vector in doc_vectors:
+        similarity = np.dot(query_vector, doc_vector)
+        scores.append(similarity)
+    
+    # Get top N documents
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
+    
+    results = []
+    for idx in top_indices:
+        if scores[idx] > 0:  # Only include documents with positive scores
+            results.append({
+                'document': original_docs[idx],
+                'score': scores[idx],
+                'tokens': tokenized_documents[idx],
+                'filename': file_names[idx] if file_names else f"Document {idx+1}",
+                'query_tokens': tokenized_query
+            })
+    
+    return results
+
+def search_documents(query, search_method, search_models, tokenized_documents, original_docs, file_names, top_n=5):
+    """
+    Unified search function that uses the specified search method
+    """
+    if search_method == "BM25":
+        bm25_model = search_models["bm25"]
+        # Get query tokens for BM25
+        tokenized_query = preprocess_text(query)
+        
+        # Get scores for each document
+        doc_scores = bm25_model.get_scores(tokenized_query)
+        
+        # Get top N documents
+        top_indices = sorted(range(len(doc_scores)), key=lambda i: doc_scores[i], reverse=True)[:top_n]
+        
+        results = []
+        for idx in top_indices:
+            if doc_scores[idx] > 0:  # Only include documents with positive scores
+                results.append({
+                    'document': original_docs[idx],
+                    'score': doc_scores[idx],
+                    'tokens': tokenized_documents[idx],
+                    'filename': file_names[idx] if file_names else f"Document {idx+1}",
+                    'query_tokens': tokenized_query
+                })
+        
+        return results
+    
+    elif search_method == "Exact Match":
+        return exact_match_search(query, tokenized_documents, original_docs, file_names, top_n)
+    
+    elif search_method == "TF-IDF":
+        vectorizer = search_models["tfidf_vectorizer"]
+        tfidf_matrix = search_models["tfidf_matrix"]
+        return tfidf_search(query, vectorizer, tfidf_matrix, tokenized_documents, original_docs, file_names, top_n)
+    
+    elif search_method == "Vector Space":
+        return vector_embeddings_search(query, tokenized_documents, original_docs, file_names, top_n)
+    
+    else:
+        # Default to BM25 if method not recognized
+        st.warning(f"Search method '{search_method}' not recognized. Using BM25 instead.")
+        return search_documents(query, "BM25", search_models, tokenized_documents, original_docs, file_names, top_n)
 
 def process_uploaded_files(uploaded_files):
     """Process uploaded PDF files and store in database"""
@@ -472,7 +639,7 @@ def process_uploaded_files(uploaded_files):
 
 # Streamlit UI
 def main():
-    st.title("PDF Search Engine with BM25")
+    st.title("PDF Search Engine with Multiple Search Methods")
     
     # Initialize database if it doesn't exist
     init_database()
@@ -485,7 +652,7 @@ def main():
         st.session_state.documents = []
         st.session_state.tokenized_docs = []
         st.session_state.file_names = []
-        st.session_state.bm25_model = None
+        st.session_state.search_models = {}
     
     # Load existing data if available
     if has_content and not st.session_state.documents:
@@ -495,9 +662,19 @@ def main():
                 st.session_state.documents = documents
                 st.session_state.tokenized_docs = tokenized_docs
                 st.session_state.file_names = file_names
-                st.session_state.bm25_model, _ = build_bm25_model(
-                    documents, tokenized_docs
-                )
+                
+                # Initialize search models
+                with st.spinner("Building search models..."):
+                    # BM25 model
+                    st.session_state.search_models["bm25"] = build_bm25_model(
+                        documents, tokenized_docs
+                    )
+                    
+                    # TF-IDF model
+                    vectorizer, tfidf_matrix = build_tfidf_model(documents)
+                    st.session_state.search_models["tfidf_vectorizer"] = vectorizer
+                    st.session_state.search_models["tfidf_matrix"] = tfidf_matrix
+                
                 st.success(f"Loaded {len(documents)} document chunks from database")
     
     # File upload section
@@ -515,9 +692,19 @@ def main():
                     st.session_state.documents.extend(new_docs)
                     st.session_state.tokenized_docs.extend(new_tokens)
                     st.session_state.file_names.extend(new_names)
-                    st.session_state.bm25_model, _ = build_bm25_model(
-                        st.session_state.documents, st.session_state.tokenized_docs
-                    )
+                    
+                    # Rebuild search models
+                    with st.spinner("Building search models..."):
+                        # BM25 model
+                        st.session_state.search_models["bm25"] = build_bm25_model(
+                            st.session_state.documents, st.session_state.tokenized_docs
+                        )
+                        
+                        # TF-IDF model
+                        vectorizer, tfidf_matrix = build_tfidf_model(st.session_state.documents)
+                        st.session_state.search_models["tfidf_vectorizer"] = vectorizer
+                        st.session_state.search_models["tfidf_matrix"] = tfidf_matrix
+                    
                     st.success(f"Added {len(new_docs)} new document chunks to the database")
     
     # Show database status
@@ -529,13 +716,23 @@ def main():
     
     # Search interface
     st.subheader("Search Documents")
+    
+    # Search method selection
+    search_method = st.selectbox(
+        "Select Search Method",
+        ["BM25", "TF-IDF", "Exact Match", "Vector Space"],
+        help="BM25: Best for relevance ranking. TF-IDF: Good for term importance. Exact Match: Best for precise queries. Vector Space: Simple vector similarity."
+    )
+    
+    # Query input
     query = st.text_input("Enter your search query")
     
-    if query and st.session_state.bm25_model:
-        with st.spinner("Searching..."):
+    if query and st.session_state.search_models:
+        with st.spinner(f"Searching using {search_method}..."):
             results = search_documents(
                 query, 
-                st.session_state.bm25_model, 
+                search_method,
+                st.session_state.search_models,
                 st.session_state.tokenized_docs, 
                 st.session_state.documents,
                 st.session_state.file_names
@@ -544,7 +741,7 @@ def main():
         if results:
             st.subheader("Search Results")
             for i, result in enumerate(results, 1):
-                with st.expander(f"Result {i}: {result['filename']} (Score: {result['score']:.2f})"):
+                with st.expander(f"Result {i}: {result['filename']} (Score: {result['score']:.4f})"):
                     # Highlight matching terms in the document
                     highlighted_text = result['document']
                     for term in preprocess_text(query):
@@ -589,6 +786,22 @@ def main():
                         st.write(f"METEOR with synonym expansion: {meteor_scores['meteor_with_synonyms']*100:.0f}%")
                         st.write(f"Exact matches: {meteor_scores['exact_matches']}")
                         st.write(f"Synonym matches: {meteor_scores['synonym_matches']}")
+                        
+                        # Show method-specific details
+                        st.markdown(f"### {search_method} Method Details:")
+                        if search_method == "BM25":
+                            st.write("BM25 uses term frequency, inverse document frequency, and document length to rank documents.")
+                            st.write("It works well for keyword-based retrieval and handles long documents better than basic TF-IDF.")
+                        elif search_method == "TF-IDF":
+                            st.write("TF-IDF weighs terms based on their frequency in the document and rarity across the corpus.")
+                            st.write("Results are ranked by cosine similarity between the query and document vectors.")
+                        elif search_method == "Exact Match":
+                            exact_match_score = len(set(result['query_tokens']).intersection(set(result['tokens'])))
+                            st.write(f"Exact matches found: {exact_match_score} out of {len(result['query_tokens'])} query terms")
+                            st.write(f"Percentage of query terms matched: {(exact_match_score/len(result['query_tokens'])*100):.1f}%")
+                        elif search_method == "Vector Space":
+                            st.write("Vector Space model represents documents as vectors in a term space.")
+                            st.write("Results are ranked by cosine similarity between the query and document vectors.")
         else:
             st.info("No matching documents found")
 
