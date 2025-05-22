@@ -7,6 +7,9 @@ import hashlib
 import pickle
 import datetime
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from nltk.corpus import stopwords, wordnet
@@ -612,6 +615,52 @@ def search_documents(query, search_method, search_models, tokenized_documents, o
         st.warning(f"Search method '{search_method}' not recognized. Using BM25 instead.")
         return search_documents(query, "BM25", search_models, tokenized_documents, original_docs, file_names, top_n)
 
+def calculate_aggregate_rouge_metrics(results):
+    """Calculate aggregate ROUGE metrics across all results"""
+    if not results:
+        return {
+            'precision': 0,
+            'recall': 0,
+            'f1_score': 0,
+            'weighted_f1_score': 0,
+            'num_results': 0
+        }
+    
+    total_precision = 0
+    total_recall = 0
+    total_f1 = 0
+    total_weighted_f1 = 0
+    total_weight = 0
+    
+    # Calculate weights based on position (higher weight for higher ranked results)
+    num_results = len(results)
+    weights = [1.0 * (num_results - i) / num_results for i in range(num_results)]
+    
+    for i, result in enumerate(results):
+        rouge_scores = calculate_rouge_l(result['query_tokens'], result['tokens'])
+        total_precision += rouge_scores['precision']
+        total_recall += rouge_scores['recall']
+        total_f1 += rouge_scores['f_measure']
+        
+        # Apply weight based on rank position (first results are more important)
+        weight = weights[i]
+        total_weighted_f1 += rouge_scores['f_measure'] * weight
+        total_weight += weight
+    
+    # Avoid division by zero
+    if total_weight == 0:
+        weighted_f1 = 0
+    else:
+        weighted_f1 = total_weighted_f1 / total_weight
+    
+    return {
+        'precision': total_precision / num_results,
+        'recall': total_recall / num_results,
+        'f1_score': total_f1 / num_results,
+        'weighted_f1_score': weighted_f1,
+        'num_results': num_results
+    }
+
 def process_uploaded_files(uploaded_files):
     """Process uploaded PDF files and store in database"""
     documents = []
@@ -739,6 +788,112 @@ def main():
             )
         
         if results:
+            # Calculate and show aggregate metrics
+            rouge_metrics = calculate_aggregate_rouge_metrics(results)
+            
+            # Display metrics using columns
+            st.subheader("Overall Search Quality Metrics (ROUGE)")
+            metrics_cols = st.columns(4)
+            with metrics_cols[0]:
+                st.metric("Precision", f"{rouge_metrics['precision']*100:.2f}%")
+            with metrics_cols[1]:
+                st.metric("Recall", f"{rouge_metrics['recall']*100:.2f}%")
+            with metrics_cols[2]:
+                st.metric("F1 Score", f"{rouge_metrics['f1_score']*100:.2f}%")
+            with metrics_cols[3]:
+                st.metric("Weighted F1 Score", f"{rouge_metrics['weighted_f1_score']*100:.2f}%")
+            
+            # Show detailed comparison for different methods
+            if st.checkbox("Show Method Comparison"):
+                # Run the query with all methods to compare
+                st.write("Comparing search methods using ROUGE metrics...")
+                comparison_data = []
+                comparison_values = {
+                    "Method": [],
+                    "Precision": [],
+                    "Recall": [],
+                    "F1 Score": [],
+                    "Weighted F1 Score": [],
+                    "Results": []
+                }
+                
+                for method in ["BM25", "TF-IDF", "Exact Match", "Vector Space"]:
+                    with st.spinner(f"Computing metrics for {method}..."):
+                        method_results = search_documents(
+                            query, 
+                            method,
+                            st.session_state.search_models,
+                            st.session_state.tokenized_docs, 
+                            st.session_state.documents,
+                            st.session_state.file_names
+                        )
+                        method_metrics = calculate_aggregate_rouge_metrics(method_results)
+                        
+                        # Store formatted values for display
+                        comparison_data.append({
+                            "Method": method,
+                            "Precision": f"{method_metrics['precision']*100:.2f}%",
+                            "Recall": f"{method_metrics['recall']*100:.2f}%",
+                            "F1 Score": f"{method_metrics['f1_score']*100:.2f}%",
+                            "Weighted F1 Score": f"{method_metrics['weighted_f1_score']*100:.2f}%",
+                            "Results": method_metrics['num_results']
+                        })
+                        
+                        # Store raw values for plotting
+                        comparison_values["Method"].append(method)
+                        comparison_values["Precision"].append(method_metrics['precision'])
+                        comparison_values["Recall"].append(method_metrics['recall'])
+                        comparison_values["F1 Score"].append(method_metrics['f1_score'])
+                        comparison_values["Weighted F1 Score"].append(method_metrics['weighted_f1_score'])
+                        comparison_values["Results"].append(method_metrics['num_results'])
+                
+                # Display comparison table
+                st.table(comparison_data)
+                
+                # Create a DataFrame for visualization
+                df = pd.DataFrame(comparison_values)
+                
+                # Plot the metrics comparison
+                st.subheader("ROUGE Metrics Comparison")
+                
+                # Prepare data for plotting
+                plot_df = pd.melt(df, 
+                                  id_vars=['Method'], 
+                                  value_vars=['Precision', 'Recall', 'F1 Score', 'Weighted F1 Score'],
+                                  var_name='Metric', 
+                                  value_name='Value')
+                
+                # Create the bar chart
+                fig, ax = plt.subplots(figsize=(10, 6))
+                sns.barplot(x='Method', y='Value', hue='Metric', data=plot_df, ax=ax)
+                ax.set_ylim(0, 1)
+                ax.set_ylabel('Score')
+                ax.set_title('ROUGE Metrics Comparison Across Search Methods')
+                
+                # Format y-axis as percentage
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: '{:.0%}'.format(y)))
+                
+                # Add value labels on the bars
+                for container in ax.containers:
+                    ax.bar_label(container, fmt='%.1f%%', label_type='edge', padding=2, fontsize=8)
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+                # Plot results count comparison
+                st.subheader("Results Count Comparison")
+                fig2, ax2 = plt.subplots(figsize=(10, 4))
+                sns.barplot(x='Method', y='Results', data=df, ax=ax2, palette='viridis')
+                ax2.set_ylabel('Number of Results')
+                ax2.set_title('Number of Results by Search Method')
+                
+                # Add value labels
+                for i, v in enumerate(df['Results']):
+                    ax2.text(i, v + 0.1, str(v), ha='center')
+                
+                plt.tight_layout()
+                st.pyplot(fig2)
+            
             st.subheader("Search Results")
             for i, result in enumerate(results, 1):
                 with st.expander(f"Result {i}: {result['filename']} (Score: {result['score']:.4f})"):
@@ -757,51 +912,77 @@ def main():
                     
                     # Use checkbox to toggle details
                     if st.checkbox(f"Show document details for result {i}", key=f"details_{i}"):
-                        st.markdown("**Document Details:**")
-                        st.write(f"Document length: {len(result['document'])} characters")
-                        st.write(f"Tokens after preprocessing: {', '.join(result['tokens'][:25])}...")
+                        # Create tabs for different details
+                        doc_tabs = st.tabs(["Document Info", "ROUGE Metrics", "METEOR Metrics", "Method Details"])
                         
-                        # Calculate and display ROUGE-L scores
-                        rouge_scores = calculate_rouge_l(result['query_tokens'], result['tokens'])
+                        with doc_tabs[0]:
+                            st.markdown("**Document Details:**")
+                            st.write(f"Document length: {len(result['document'])} characters")
+                            st.write(f"Tokens after preprocessing: {', '.join(result['tokens'][:25])}...")
                         
-                        st.markdown("### ROUGE-L Calculation Details:")
-                        st.write(f"Token reference sentence (after stemming): {result['query_tokens']} ... ({len(result['query_tokens'])} tokens in total)")
-                        st.write(f"Prediction sentence tokens (after stemming): {result['tokens'][:10]} ... (total {len(result['tokens'])} tokens)")
-                        st.write(f"Number of reference sentence tokens: {len(result['query_tokens'])}")
-                        st.write(f"Number of prediction sentence tokens: {len(result['tokens'])}")
-                        st.write(f"LCS length: {rouge_scores['lcs_length']}")
-                        st.write(f"Precision = LCS / Number of prediction tokens = {rouge_scores['lcs_length']} / {len(result['tokens'])} = {rouge_scores['precision']:.4f} = {rouge_scores['precision']*100:.0f}%")
-                        st.write(f"Recall = LCS / Number of reference tokens = {rouge_scores['lcs_length']} / {len(result['query_tokens'])} = {rouge_scores['recall']:.4f} = {rouge_scores['recall']*100:.0f}%")
-                        st.write(f"F-measure = (2 * Precision * Recall) / (Precision + Recall)")
-                        st.write(f"= (2 * {rouge_scores['precision']:.4f} * {rouge_scores['recall']:.4f}) / ({rouge_scores['precision']:.4f} + {rouge_scores['recall']:.4f})")
-                        st.write(f"= {rouge_scores['f_measure']:.4f} = {rouge_scores['f_measure']*100:.0f}%")
+                        with doc_tabs[1]:
+                            # Calculate and display ROUGE-L scores
+                            rouge_scores = calculate_rouge_l(result['query_tokens'], result['tokens'])
+                            
+                            st.markdown("### ROUGE-L Calculation Details:")
+                            st.write(f"Token reference sentence (after stemming): {result['query_tokens']} ... ({len(result['query_tokens'])} tokens in total)")
+                            st.write(f"Prediction sentence tokens (after stemming): {result['tokens'][:10]} ... (total {len(result['tokens'])} tokens)")
+                            st.write(f"Number of reference sentence tokens: {len(result['query_tokens'])}")
+                            st.write(f"Number of prediction sentence tokens: {len(result['tokens'])}")
+                            st.write(f"LCS length: {rouge_scores['lcs_length']}")
+                            
+                            # Display metrics in a more visual way
+                            rouge_cols = st.columns(3)
+                            with rouge_cols[0]:
+                                st.metric("Precision", f"{rouge_scores['precision']*100:.2f}%")
+                                st.write(f"LCS / Prediction = {rouge_scores['lcs_length']} / {len(result['tokens'])}")
+                            
+                            with rouge_cols[1]:
+                                st.metric("Recall", f"{rouge_scores['recall']*100:.2f}%")
+                                st.write(f"LCS / Reference = {rouge_scores['lcs_length']} / {len(result['query_tokens'])}")
+                            
+                            with rouge_cols[2]:
+                                st.metric("F1 Score", f"{rouge_scores['f_measure']*100:.2f}%")
+                                st.write(f"2 * P * R / (P + R)")
                         
-                        # Calculate and display METEOR scores
-                        meteor_scores = calculate_meteor(result['query_tokens'], result['tokens'])
+                        with doc_tabs[2]:
+                            # Calculate and display METEOR scores
+                            meteor_scores = calculate_meteor(result['query_tokens'], result['tokens'])
+                            
+                            st.markdown("### METEOR Calculation Details:")
+                            
+                            # Display METEOR metrics visually
+                            meteor_cols = st.columns(3)
+                            with meteor_cols[0]:
+                                st.metric("METEOR Score", f"{meteor_scores['meteor_with_synonyms']*100:.2f}%")
+                            
+                            with meteor_cols[1]:
+                                st.metric("Basic METEOR", f"{meteor_scores['basic_meteor']*100:.2f}%")
+                                st.write(f"Exact matches: {meteor_scores['exact_matches']}")
+                            
+                            with meteor_cols[2]:
+                                synonym_contribution = (meteor_scores['meteor_with_synonyms'] - meteor_scores['basic_meteor'])*100
+                                st.metric("Synonym Contribution", f"{synonym_contribution:.2f}%")
+                                st.write(f"Synonym matches: {meteor_scores['synonym_matches']}")
+                            
+                            st.write("METEOR is calculated based on matching tokens between reference and prediction sentences with synonym expansion.")
                         
-                        st.markdown("### METEOR Calculation Details:")
-                        st.write(f"METEOR Score: {meteor_scores['meteor_with_synonyms']*100:.0f}%")
-                        st.write("METEOR is calculated based on matching tokens between reference and prediction sentences with synonym expansion.")
-                        st.write(f"Basic METEOR (without synonym expansion): {meteor_scores['basic_meteor']*100:.0f}%")
-                        st.write(f"METEOR with synonym expansion: {meteor_scores['meteor_with_synonyms']*100:.0f}%")
-                        st.write(f"Exact matches: {meteor_scores['exact_matches']}")
-                        st.write(f"Synonym matches: {meteor_scores['synonym_matches']}")
-                        
-                        # Show method-specific details
-                        st.markdown(f"### {search_method} Method Details:")
-                        if search_method == "BM25":
-                            st.write("BM25 uses term frequency, inverse document frequency, and document length to rank documents.")
-                            st.write("It works well for keyword-based retrieval and handles long documents better than basic TF-IDF.")
-                        elif search_method == "TF-IDF":
-                            st.write("TF-IDF weighs terms based on their frequency in the document and rarity across the corpus.")
-                            st.write("Results are ranked by cosine similarity between the query and document vectors.")
-                        elif search_method == "Exact Match":
-                            exact_match_score = len(set(result['query_tokens']).intersection(set(result['tokens'])))
-                            st.write(f"Exact matches found: {exact_match_score} out of {len(result['query_tokens'])} query terms")
-                            st.write(f"Percentage of query terms matched: {(exact_match_score/len(result['query_tokens'])*100):.1f}%")
-                        elif search_method == "Vector Space":
-                            st.write("Vector Space model represents documents as vectors in a term space.")
-                            st.write("Results are ranked by cosine similarity between the query and document vectors.")
+                        with doc_tabs[3]:
+                            # Show method-specific details
+                            st.markdown(f"### {search_method} Method Details:")
+                            if search_method == "BM25":
+                                st.write("BM25 uses term frequency, inverse document frequency, and document length to rank documents.")
+                                st.write("It works well for keyword-based retrieval and handles long documents better than basic TF-IDF.")
+                            elif search_method == "TF-IDF":
+                                st.write("TF-IDF weighs terms based on their frequency in the document and rarity across the corpus.")
+                                st.write("Results are ranked by cosine similarity between the query and document vectors.")
+                            elif search_method == "Exact Match":
+                                exact_match_score = len(set(result['query_tokens']).intersection(set(result['tokens'])))
+                                st.metric("Exact Match Score", f"{(exact_match_score/len(result['query_tokens'])*100):.1f}%")
+                                st.write(f"Exact matches found: {exact_match_score} out of {len(result['query_tokens'])} query terms")
+                            elif search_method == "Vector Space":
+                                st.write("Vector Space model represents documents as vectors in a term space.")
+                                st.write("Results are ranked by cosine similarity between the query and document vectors.")
         else:
             st.info("No matching documents found")
 
