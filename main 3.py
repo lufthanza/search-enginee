@@ -6,19 +6,24 @@ import sqlite3
 import hashlib
 import pickle
 import datetime
+import numpy as np
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 from nltk.stem import PorterStemmer
+from nltk.translate.meteor_score import meteor_score
+from collections import Counter
 
 # Download NLTK resources if not already available
 try:
     nltk.data.find('tokenizers/punkt')
     nltk.data.find('corpora/stopwords')
+    nltk.data.find('corpora/wordnet')
 except LookupError:
     nltk.download('punkt')
     nltk.download('stopwords')
+    nltk.download('wordnet')
 
 # Initialize stemmer and stopwords
 stemmer = PorterStemmer()
@@ -319,6 +324,103 @@ def build_bm25_model(documents, tokenized_docs=None):
         tokenized_docs = [preprocess_text(doc) for doc in documents]
     return BM25Okapi(tokenized_docs), tokenized_docs
 
+def calculate_lcs_length(X, Y):
+    """Calculate longest common subsequence length between two token lists"""
+    m, n = len(X), len(Y)
+    
+    # Create a table to store lengths of LCS for all sub-problems
+    L = [[0 for _ in range(n+1)] for _ in range(m+1)]
+    
+    # Build L[m+1][n+1] in bottom-up fashion
+    for i in range(m+1):
+        for j in range(n+1):
+            if i == 0 or j == 0:
+                L[i][j] = 0
+            elif X[i-1] == Y[j-1]:
+                L[i][j] = L[i-1][j-1] + 1
+            else:
+                L[i][j] = max(L[i-1][j], L[i][j-1])
+    
+    # L[m][n] contains the length of LCS
+    return L[m][n]
+
+def calculate_rouge_l(reference_tokens, prediction_tokens):
+    """Calculate ROUGE-L score between reference and prediction tokens"""
+    lcs_length = calculate_lcs_length(reference_tokens, prediction_tokens)
+    
+    if len(prediction_tokens) == 0:
+        precision = 0.0
+    else:
+        precision = lcs_length / len(prediction_tokens)
+        
+    if len(reference_tokens) == 0:
+        recall = 0.0
+    else:
+        recall = lcs_length / len(reference_tokens)
+    
+    if precision + recall == 0:
+        f_measure = 0.0
+    else:
+        f_measure = (2 * precision * recall) / (precision + recall)
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f_measure': f_measure,
+        'lcs_length': lcs_length
+    }
+
+def get_synonyms(word):
+    """Get synonyms for a word using WordNet"""
+    synonyms = set()
+    for syn in wordnet.synsets(word):
+        for lemma in syn.lemmas():
+            synonyms.add(lemma.name().lower())
+    return synonyms
+
+def calculate_meteor(reference_tokens, prediction_tokens):
+    """Calculate METEOR score between reference and prediction tokens"""
+    # Basic METEOR (exact matches)
+    reference_counter = Counter(reference_tokens)
+    prediction_counter = Counter(prediction_tokens)
+    
+    matches = sum((reference_counter & prediction_counter).values())
+    basic_precision = matches / len(prediction_tokens) if prediction_tokens else 0
+    basic_recall = matches / len(reference_tokens) if reference_tokens else 0
+    
+    if basic_precision + basic_recall == 0:
+        basic_f_score = 0
+    else:
+        basic_f_score = (2 * basic_precision * basic_recall) / (basic_precision + basic_recall)
+    
+    # METEOR with synonym expansion
+    synonym_matches = 0
+    for token in prediction_tokens:
+        if token in reference_tokens:
+            continue  # Already counted in exact matches
+        
+        token_synonyms = get_synonyms(token)
+        for ref_token in reference_tokens:
+            if ref_token in token_synonyms:
+                synonym_matches += 1
+                break
+    
+    total_matches = matches + synonym_matches
+    syn_precision = total_matches / len(prediction_tokens) if prediction_tokens else 0
+    syn_recall = total_matches / len(reference_tokens) if reference_tokens else 0
+    
+    if syn_precision + syn_recall == 0:
+        meteor_score = 0
+    else:
+        meteor_score = (2 * syn_precision * syn_recall) / (syn_precision + syn_recall)
+    
+    return {
+        'basic_meteor': basic_f_score,
+        'meteor_with_synonyms': meteor_score,
+        'exact_matches': matches,
+        'synonym_matches': synonym_matches
+    }
+
 def search_documents(query, bm25_model, tokenized_documents, original_docs, file_names, top_n=5):
     """Search documents using BM25"""
     # Preprocess the query
@@ -337,7 +439,8 @@ def search_documents(query, bm25_model, tokenized_documents, original_docs, file
                 'document': original_docs[idx],
                 'score': doc_scores[idx],
                 'tokens': tokenized_documents[idx],
-                'filename': file_names[idx] if file_names else f"Document {idx+1}"
+                'filename': file_names[idx] if file_names else f"Document {idx+1}",
+                'query_tokens': tokenized_query  # Store query tokens for evaluation
             })
     
     return results
@@ -460,6 +563,32 @@ def main():
                         st.markdown("**Document Details:**")
                         st.write(f"Document length: {len(result['document'])} characters")
                         st.write(f"Tokens after preprocessing: {', '.join(result['tokens'][:25])}...")
+                        
+                        # Calculate and display ROUGE-L scores
+                        rouge_scores = calculate_rouge_l(result['query_tokens'], result['tokens'])
+                        
+                        st.markdown("### ROUGE-L Calculation Details:")
+                        st.write(f"Token reference sentence (after stemming): {result['query_tokens']} ... ({len(result['query_tokens'])} tokens in total)")
+                        st.write(f"Prediction sentence tokens (after stemming): {result['tokens'][:10]} ... (total {len(result['tokens'])} tokens)")
+                        st.write(f"Number of reference sentence tokens: {len(result['query_tokens'])}")
+                        st.write(f"Number of prediction sentence tokens: {len(result['tokens'])}")
+                        st.write(f"LCS length: {rouge_scores['lcs_length']}")
+                        st.write(f"Precision = LCS / Number of prediction tokens = {rouge_scores['lcs_length']} / {len(result['tokens'])} = {rouge_scores['precision']:.4f} = {rouge_scores['precision']*100:.0f}%")
+                        st.write(f"Recall = LCS / Number of reference tokens = {rouge_scores['lcs_length']} / {len(result['query_tokens'])} = {rouge_scores['recall']:.4f} = {rouge_scores['recall']*100:.0f}%")
+                        st.write(f"F-measure = (2 * Precision * Recall) / (Precision + Recall)")
+                        st.write(f"= (2 * {rouge_scores['precision']:.4f} * {rouge_scores['recall']:.4f}) / ({rouge_scores['precision']:.4f} + {rouge_scores['recall']:.4f})")
+                        st.write(f"= {rouge_scores['f_measure']:.4f} = {rouge_scores['f_measure']*100:.0f}%")
+                        
+                        # Calculate and display METEOR scores
+                        meteor_scores = calculate_meteor(result['query_tokens'], result['tokens'])
+                        
+                        st.markdown("### METEOR Calculation Details:")
+                        st.write(f"METEOR Score: {meteor_scores['meteor_with_synonyms']*100:.0f}%")
+                        st.write("METEOR is calculated based on matching tokens between reference and prediction sentences with synonym expansion.")
+                        st.write(f"Basic METEOR (without synonym expansion): {meteor_scores['basic_meteor']*100:.0f}%")
+                        st.write(f"METEOR with synonym expansion: {meteor_scores['meteor_with_synonyms']*100:.0f}%")
+                        st.write(f"Exact matches: {meteor_scores['exact_matches']}")
+                        st.write(f"Synonym matches: {meteor_scores['synonym_matches']}")
         else:
             st.info("No matching documents found")
 
