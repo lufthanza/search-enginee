@@ -9,6 +9,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import seaborn as sns
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
@@ -688,6 +689,107 @@ def process_uploaded_files(uploaded_files):
 
 # Streamlit UI
 def main():
+    # Configure page layout for full width
+    st.set_page_config(
+        page_title="PDF Search Engine",
+        page_icon="🔍",
+        layout="wide",  # This makes the app use full width
+        initial_sidebar_state="auto"
+    )
+    
+    # Custom CSS to make the app more responsive and full screen
+    st.markdown("""
+    <style>
+    /* Remove default padding and margins */
+    .main > div {
+        max-width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+    
+    /* Make containers use full width */
+    .stContainer {
+        max-width: 100%;
+    }
+    
+    /* Adjust sidebar width for better responsive design */
+    .css-1d391kg {
+        width: 250px;
+    }
+    
+    /* Full width for dataframes and charts */
+    .dataframe, .stDataFrame {
+        width: 100% !important;
+    }
+    
+    /* Responsive design for mobile */
+    @media (max-width: 768px) {
+        .main > div {
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+        }
+        
+        .stColumns > div {
+            min-width: unset !important;
+            flex: 1 1 0px;
+        }
+        
+        /* Stack columns vertically on mobile */
+        .stColumns {
+            flex-direction: column;
+        }
+    }
+    
+    /* Hide hamburger menu and footer for cleaner look */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Custom styling for better visual appeal */
+    .stTitle {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    
+    /* Improve expander styling */
+    .streamlit-expanderHeader {
+        font-size: 1.1rem;
+        font-weight: bold;
+    }
+    
+    /* Better metric display */
+    .metric-container {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+    }
+    
+    /* Responsive charts */
+    .stPlotlyChart {
+        width: 100% !important;
+    }
+    </style>
+    
+    <script>
+    // Detect screen size and adjust layout
+    function detectScreenSize() {
+        return window.innerWidth < 768;
+    }
+    
+    // Auto-adjust based on screen size
+    window.addEventListener('resize', function() {
+        if (detectScreenSize()) {
+            document.body.classList.add('mobile-view');
+        } else {
+            document.body.classList.remove('mobile-view');
+        }
+    });
+    </script>
+    """, unsafe_allow_html=True)
+
     st.title("PDF Search Engine with Multiple Search Methods")
     
     # Initialize database if it doesn't exist
@@ -791,17 +893,27 @@ def main():
             # Calculate and show aggregate metrics
             rouge_metrics = calculate_aggregate_rouge_metrics(results)
             
-            # Display metrics using columns
+            # Display metrics using responsive columns
             st.subheader("Overall Search Quality Metrics (ROUGE)")
-            metrics_cols = st.columns(4)
-            with metrics_cols[0]:
+            
+            # Use responsive columns that adapt to screen size
+            if st.session_state.get('mobile_view', False):
+                # Stack metrics vertically on mobile
                 st.metric("Precision", f"{rouge_metrics['precision']*100:.2f}%")
-            with metrics_cols[1]:
                 st.metric("Recall", f"{rouge_metrics['recall']*100:.2f}%")
-            with metrics_cols[2]:
                 st.metric("F1 Score", f"{rouge_metrics['f1_score']*100:.2f}%")
-            with metrics_cols[3]:
                 st.metric("Weighted F1 Score", f"{rouge_metrics['weighted_f1_score']*100:.2f}%")
+            else:
+                # Use columns for larger screens
+                metrics_cols = st.columns(4)
+                with metrics_cols[0]:
+                    st.metric("Precision", f"{rouge_metrics['precision']*100:.2f}%")
+                with metrics_cols[1]:
+                    st.metric("Recall", f"{rouge_metrics['recall']*100:.2f}%")
+                with metrics_cols[2]:
+                    st.metric("F1 Score", f"{rouge_metrics['f1_score']*100:.2f}%")
+                with metrics_cols[3]:
+                    st.metric("Weighted F1 Score", f"{rouge_metrics['weighted_f1_score']*100:.2f}%")
             
             # Show detailed comparison for different methods
             if st.checkbox("Show Method Comparison"):
@@ -863,31 +975,29 @@ def main():
                                   var_name='Metric', 
                                   value_name='Value')
                 
-                # Create the bar chart
-                fig, ax = plt.subplots(figsize=(10, 6))
+                # Create the bar chart with responsive sizing
+                fig_width = 12 if st.session_state.get('desktop_view', True) else 8
+                fig, ax = plt.subplots(figsize=(fig_width, 6))
                 sns.barplot(x='Method', y='Value', hue='Metric', data=plot_df, ax=ax)
                 ax.set_ylim(0, 1)
                 ax.set_ylabel('Score')
                 ax.set_title('ROUGE Metrics Comparison Across Search Methods')
                 
                 # Format y-axis as percentage
-                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: '{:.0%}'.format(y)))
-                
-                # Add value labels on the bars
-                for container in ax.containers:
-                    ax.bar_label(container, fmt='%.1f%%', label_type='edge', padding=2, fontsize=8)
+                ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: '{:.0%}'.format(y)))
                 
                 plt.tight_layout()
                 st.pyplot(fig)
                 
-                # Plot results count comparison
+                # Plot results count comparison with responsive sizing
                 st.subheader("Results Count Comparison")
-                fig2, ax2 = plt.subplots(figsize=(10, 4))
+                fig2_width = 10 if st.session_state.get('desktop_view', True) else 8
+                fig2, ax2 = plt.subplots(figsize=(fig2_width, 4))
                 sns.barplot(x='Method', y='Results', data=df, ax=ax2, palette='viridis')
                 ax2.set_ylabel('Number of Results')
                 ax2.set_title('Number of Results by Search Method')
                 
-                # Add value labels
+                # Add value labels manually
                 for i, v in enumerate(df['Results']):
                     ax2.text(i, v + 0.1, str(v), ha='center')
                 
@@ -941,6 +1051,7 @@ def main():
                                 st.metric("Recall", f"{rouge_scores['recall']*100:.2f}%")
                                 st.write(f"LCS / Reference = {rouge_scores['lcs_length']} / {len(result['query_tokens'])}")
                             
+
                             with rouge_cols[2]:
                                 st.metric("F1 Score", f"{rouge_scores['f_measure']*100:.2f}%")
                                 st.write(f"2 * P * R / (P + R)")
@@ -960,11 +1071,13 @@ def main():
                                 st.metric("Basic METEOR", f"{meteor_scores['basic_meteor']*100:.2f}%")
                                 st.write(f"Exact matches: {meteor_scores['exact_matches']}")
                             
+
                             with meteor_cols[2]:
                                 synonym_contribution = (meteor_scores['meteor_with_synonyms'] - meteor_scores['basic_meteor'])*100
                                 st.metric("Synonym Contribution", f"{synonym_contribution:.2f}%")
                                 st.write(f"Synonym matches: {meteor_scores['synonym_matches']}")
                             
+
                             st.write("METEOR is calculated based on matching tokens between reference and prediction sentences with synonym expansion.")
                         
                         with doc_tabs[3]:
